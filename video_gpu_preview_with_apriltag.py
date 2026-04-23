@@ -2725,7 +2725,7 @@ def run_video_preview(
     mqtt_port: int = 1883,
     mqtt_topic_prefix: str = "video/telemetry",
     parquet_enable: bool = True,
-    parquet_output_dir: str = "recordings/telemetry",
+    parquet_output_dir: str = "recordings",
     board_pose_stream_enable: bool = False,
     board_pose_stream_host: str = "0.0.0.0",
     board_pose_stream_port: int = 9102,
@@ -5058,7 +5058,7 @@ def main() -> int:
     parser.add_argument("--freed-port", type=int, default=10244, help="UDP port for freeD packets (default: 10244)")
     parser.add_argument("--mqtt-enable", action="store_true", help="Enable MQTT telemetry publishing")
     parser.add_argument("--parquet-disable", action="store_true", help="Disable Parquet telemetry sink (enabled by default)")
-    parser.add_argument("--parquet-output-dir", type=str, default="recordings/telemetry", help="Output directory for Parquet telemetry sessions")
+    parser.add_argument("--parquet-output-dir", type=str, default="recordings", help="Output root for Parquet telemetry sessions")
     parser.add_argument("--mqtt-host", type=str, default="127.0.0.1", help="MQTT broker host (default: 127.0.0.1)")
     parser.add_argument("--mqtt-port", type=int, default=1883, help="MQTT broker port (default: 1883)")
     parser.add_argument("--mqtt-topic-prefix", type=str, default="video/telemetry", help="MQTT topic prefix")
