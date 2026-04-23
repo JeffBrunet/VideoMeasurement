@@ -5,9 +5,13 @@ param(
     [string]$VideoSearchDir = 'Videos',
     [switch]$VideoLoop,
     [switch]$VideoNoRealtime,
+    [ValidateSet('auto', 'opencv', 'pyav')]
+    [string]$VideoDecodeBackend = 'auto',
+    [int]$VideoDecodeThreads = 0,
     [string]$Dicts = 'DICT_APRILTAG_36h11',
     [string]$BoardJson = 'boards\boardLab55center.json',
     [switch]$NoDisplay,
+    [switch]$Display,
     [int]$GpuIndex = 0,
     [double]$TelemetryInterval = 1.0,
     [double]$FocalLength = 2180,
@@ -25,10 +29,12 @@ param(
     [string]$RawRecordFfmpegEncoder = 'h264_nvenc',
     [string]$RawRecordFfmpegPreset = 'p5',
     [double]$RawRecordScale = 0.5,
+    [switch]$RawRecordStartDisabled,
+    [switch]$OverlayDataDisable,
     [switch]$MqttEnable,
     [switch]$MqttDisable,
     [switch]$ParquetDisable,
-    [string]$ParquetOutputDir = 'recordings\telemetry',
+    [string]$ParquetOutputDir = 'recordings',
     [string]$MqttHost = '127.0.0.1',
     [int]$MqttPort = 1883,
     [string]$MqttTopicPrefix = 'ndi/telemetry',
@@ -188,6 +194,8 @@ $pyArgs = @(
     '--tag-size-mm', "$TagSizeMm",
     '--display-fps', "$DisplayFps",
     '--display-scale', "$DisplayScale",
+    '--video-decode-backend', $VideoDecodeBackend,
+    '--video-decode-threads', "$VideoDecodeThreads",
     '--video-deinterlace', $VideoDeinterlace,
     '--raw-record-output-dir', $resolvedRawRecordOutputDir,
     '--raw-record-backend', $RawRecordBackend,
@@ -224,7 +232,7 @@ if ($VideoLoop.IsPresent) {
 if ($VideoNoRealtime.IsPresent) {
     $pyArgs += '--video-no-realtime'
 }
-if ($NoDisplay.IsPresent) {
+if ($NoDisplay.IsPresent -or -not $Display.IsPresent) {
     $pyArgs += '--no-display'
 }
 if ($null -ne $CornerRefinementMethod) {
@@ -235,6 +243,12 @@ if ($MqttEnable.IsPresent -and -not $MqttDisable.IsPresent) {
 }
 if ($ParquetDisable.IsPresent) {
     $pyArgs += '--parquet-disable'
+}
+if ($RawRecordStartDisabled.IsPresent) {
+    $pyArgs += '--raw-record-start-disabled'
+}
+if ($OverlayDataDisable.IsPresent) {
+    $pyArgs += '--overlay-data-disable'
 }
 if ($BoardPoseStreamEnable.IsPresent) {
     $pyArgs += '--board-pose-stream-enable'

@@ -36,6 +36,13 @@ except Exception:
     _PARQUET_AVAILABLE = False
 
 try:
+    av = importlib.import_module("av")
+    _PYAV_AVAILABLE = True
+except Exception:
+    av = None
+    _PYAV_AVAILABLE = False
+
+try:
     import glfw
     from OpenGL.GL import (
         GL_BGR, GL_RGB, GL_TEXTURE_2D, GL_UNSIGNED_BYTE,
@@ -212,21 +219,46 @@ def extract_video_meta(
     xres = int(max(0, capture.get(cv2.CAP_PROP_FRAME_WIDTH)))
     yres = int(max(0, capture.get(cv2.CAP_PROP_FRAME_HEIGHT)))
     fps = float(capture.get(cv2.CAP_PROP_FPS))
-    fps_str = f"{fps:.3f}" if fps > 0.0 else "?"
-    aspect = f"{(float(xres) / float(yres)):.4f}" if yres > 0 else "?"
+    fourcc = _decode_fourcc(capture.get(cv2.CAP_PROP_FOURCC))
+    return build_video_meta(
+        source_name=source_name,
+        capture_backend=capture_backend,
+        frame_index=frame_index,
+        frame_count=frame_count,
+        media_ts_ms=media_ts_ms,
+        xres=xres,
+        yres=yres,
+        fps=fps,
+        fourcc=fourcc,
+    )
+
+
+def build_video_meta(
+    source_name: str,
+    capture_backend: str,
+    frame_index: int,
+    frame_count: int,
+    media_ts_ms: float,
+    xres: int,
+    yres: int,
+    fps: float,
+    fourcc: str,
+) -> dict:
+    fps_str = f"{fps:.3f}" if float(fps) > 0.0 else "?"
+    aspect = f"{(float(xres) / float(yres)):.4f}" if int(yres) > 0 else "?"
     media_seconds = max(0.0, float(media_ts_ms) / 1000.0)
     return {
         "source": source_name,
-        "xres": xres,
-        "yres": yres,
+        "xres": int(xres),
+        "yres": int(yres),
         "fps_str": fps_str,
         "fps_n": 0,
         "fps_d": 1,
-        "fourcc": _decode_fourcc(capture.get(cv2.CAP_PROP_FOURCC)),
+        "fourcc": str(fourcc),
         "aspect": aspect,
         "frame_fmt": "FILE",
         "timecode": format_media_timestamp(media_seconds),
-        "stride": xres * 3 if xres > 0 else 0,
+        "stride": int(xres) * 3 if int(xres) > 0 else 0,
         "backend": capture_backend,
         "frame_index": int(frame_index),
         "frame_count": int(frame_count),
@@ -683,12 +715,14 @@ class ParquetTelemetryWriter:
         enabled: bool,
         output_dir: str,
         source_name: str,
+        session_dir: str | None = None,
         flush_rows: int = 2000,
         flush_interval_s: float = 1.0,
     ) -> None:
         self.enabled = bool(enabled)
         self.output_dir = output_dir
         self.source_name = source_name
+        self.session_dir = session_dir
         self.flush_rows = max(200, int(flush_rows))
         self.flush_interval_s = max(0.1, float(flush_interval_s))
 
@@ -734,10 +768,13 @@ class ParquetTelemetryWriter:
         assert pa is not None
         assert pq is not None
 
-        stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        safe_source = "".join(ch if (ch.isalnum() or ch in ("-", "_")) else "_" for ch in self.source_name)
-        safe_source = safe_source.strip("_") or "source"
-        session_dir = os.path.join(self.output_dir, f"{stamp}_{safe_source}")
+        if self.session_dir:
+            session_dir = self.session_dir
+        else:
+            stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+            safe_source = "".join(ch if (ch.isalnum() or ch in ("-", "_")) else "_" for ch in self.source_name)
+            safe_source = safe_source.strip("_") or "source"
+            session_dir = os.path.join(self.output_dir, f"{stamp}_{safe_source}")
         os.makedirs(session_dir, exist_ok=True)
         parquet_path = os.path.join(session_dir, "telemetry.parquet")
         manifest_path = os.path.join(session_dir, "manifest.json")
@@ -828,6 +865,151 @@ class ParquetTelemetryWriter:
                 pass
 
 
+class OverlayDataWriter:
+    """Persist per-frame overlay inputs so overlays can be rendered in a second pass."""
+
+    def __init__(self, enabled: bool, session_dir: str, file_name: str = "overlay_data.jsonl") -> None:
+        self.enabled = bool(enabled)
+        self.session_dir = session_dir
+        self.file_name = file_name
+        self._queue: queue.Queue[dict] = queue.Queue(maxsize=20000)
+        self._stop = threading.Event()
+        self._thread: threading.Thread | None = None
+        self._dropped = 0
+
+    def start(self) -> None:
+        if not self.enabled:
+            return
+        self._thread = threading.Thread(target=self._run, daemon=True, name="overlay-data")
+        self._thread.start()
+
+    def stop(self) -> tuple[str | None, int]:
+        self._stop.set()
+        if self._thread is not None:
+            self._thread.join(timeout=5.0)
+        path = os.path.join(self.session_dir, self.file_name) if self.enabled else None
+        return path, int(self._dropped)
+
+    def publish(self, payload: dict) -> None:
+        if not self.enabled:
+            return
+        try:
+            self._queue.put_nowait(dict(payload))
+        except queue.Full:
+            self._dropped += 1
+            try:
+                self._queue.get_nowait()
+            except queue.Empty:
+                pass
+            try:
+                self._queue.put_nowait(dict(payload))
+            except queue.Full:
+                self._dropped += 1
+
+    def _run(self) -> None:
+        os.makedirs(self.session_dir, exist_ok=True)
+        path = os.path.join(self.session_dir, self.file_name)
+        try:
+            with open(path, "w", encoding="utf-8") as fp:
+                while not self._stop.is_set() or not self._queue.empty():
+                    try:
+                        row = self._queue.get(timeout=0.2)
+                    except queue.Empty:
+                        continue
+                    fp.write(json.dumps(row, separators=(",", ":")) + "\n")
+        except Exception as exc:
+            print(f"OverlayData: writer error ({exc})")
+
+
+class PyAvVideoDecoder:
+    """File decoder using FFmpeg via PyAV with multithreaded codec decode."""
+
+    def __init__(self, video_path: str, decode_threads: int = 0) -> None:
+        if not _PYAV_AVAILABLE or av is None:
+            raise RuntimeError("PyAV is not available")
+
+        self.video_path = video_path
+        self.decode_threads = max(0, int(decode_threads))
+        self.backend_name = "PYAV"
+
+        self._container = av.open(video_path, mode="r")
+        if not self._container.streams.video:
+            raise RuntimeError(f"No video stream found in {video_path}")
+        self._stream = self._container.streams.video[0]
+        self._codec_name = str(getattr(self._stream, "codec_context", {}).name if getattr(self._stream, "codec_context", None) is not None else "")
+
+        codec_ctx = self._stream.codec_context
+        try:
+            codec_ctx.thread_type = "AUTO"
+        except Exception:
+            pass
+        if self.decode_threads > 0:
+            try:
+                codec_ctx.thread_count = int(self.decode_threads)
+            except Exception:
+                pass
+
+        self.width = int(self._stream.width or 0)
+        self.height = int(self._stream.height or 0)
+        self.frame_count = int(self._stream.frames or 0)
+
+        self.fps = 0.0
+        try:
+            if self._stream.average_rate is not None:
+                self.fps = float(self._stream.average_rate)
+        except Exception:
+            self.fps = 0.0
+        if self.fps <= 0.0:
+            try:
+                if self._stream.base_rate is not None:
+                    self.fps = float(self._stream.base_rate)
+            except Exception:
+                self.fps = 0.0
+
+        self._iter = iter(self._container.decode(video=0))
+        self._frame_index = 0
+
+    @property
+    def codec_name(self) -> str:
+        return self._codec_name or "?"
+
+    def read(self) -> tuple[bool, np.ndarray | None, int, float]:
+        try:
+            frame = next(self._iter)
+        except StopIteration:
+            return False, None, -1, -1.0
+        except Exception:
+            return False, None, -1, -1.0
+
+        frame_index = self._frame_index
+        self._frame_index += 1
+
+        try:
+            bgr = frame.to_ndarray(format="bgr24")
+        except Exception:
+            return False, None, -1, -1.0
+
+        media_ts_ms = -1.0
+        try:
+            if frame.time is not None:
+                media_ts_ms = float(frame.time) * 1000.0
+            elif frame.pts is not None and self._stream.time_base is not None:
+                media_ts_ms = float(frame.pts * self._stream.time_base) * 1000.0
+        except Exception:
+            media_ts_ms = -1.0
+
+        if media_ts_ms < 0.0:
+            media_ts_ms = (frame_index / max(1.0, self.fps)) * 1000.0
+
+        return True, bgr, frame_index, media_ts_ms
+
+    def release(self) -> None:
+        try:
+            self._container.close()
+        except Exception:
+            pass
+
+
 class RawFrameRecorder:
     """Asynchronous raw frame recorder (video + JSONL metadata sidecar)."""
 
@@ -866,15 +1048,16 @@ class RawFrameRecorder:
         with self._lock:
             return int(self._dropped_frames)
 
-    def start_recording(self, frame_width: int, frame_height: int) -> bool:
+    def start_recording(self, frame_width: int, frame_height: int, session_dir: str | None = None) -> bool:
         with self._lock:
             if self._active:
                 return False
             self._active = True
             self._dropped_frames = 0
 
-        stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        session_dir = os.path.join(self.base_output_dir, stamp)
+        if session_dir is None:
+            stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+            session_dir = os.path.join(self.base_output_dir, stamp)
         self._enqueue_control((
             "start",
             {
@@ -2099,6 +2282,33 @@ def scale_detections_for_display(
     return scaled_detections
 
 
+def serialize_detections(detections: _DetectionList) -> list[dict]:
+    serialized: list[dict] = []
+    for dict_name, corners, ids in detections:
+        ids_list = [int(v) for v in ids.flatten()] if ids is not None else []
+        corners_list = [np.asarray(corner, dtype=np.float32).reshape(-1, 2).tolist() for corner in corners]
+        serialized.append(
+            {
+                "dict_name": str(dict_name),
+                "ids": ids_list,
+                "corners": corners_list,
+            }
+        )
+    return serialized
+
+
+def deserialize_detections(serialized: list[dict]) -> _DetectionList:
+    detections: _DetectionList = []
+    for entry in serialized:
+        dict_name = str(entry.get("dict_name", ""))
+        ids_list = entry.get("ids", [])
+        corners_list = entry.get("corners", [])
+        ids_np = np.asarray(ids_list, dtype=np.int32).reshape(-1, 1) if ids_list else None
+        corners = [np.asarray(corner, dtype=np.float32).reshape(1, 4, 2) for corner in corners_list]
+        detections.append((dict_name, corners, ids_np))
+    return detections
+
+
 def draw_tag_detections(
     image: np.ndarray,
     detections: _DetectionList,
@@ -2194,6 +2404,131 @@ def build_tag_overlay(
         mask[y:y + height, x:x + width].copy(),
         (x, y, width, height),
     )
+
+
+def render_overlay_video_pass(session_dir: str, overlay_jsonl_path: str) -> str | None:
+    """Render an overlay video from clean recording + saved overlay metadata."""
+    manifest_path = os.path.join(session_dir, "manifest.json")
+    if not os.path.isfile(manifest_path) or not os.path.isfile(overlay_jsonl_path):
+        return None
+
+    try:
+        with open(manifest_path, "r", encoding="utf-8") as fp:
+            manifest = json.load(fp)
+    except Exception:
+        return None
+
+    clean_video_path = str(manifest.get("video_path", ""))
+    frames_metadata_path = str(manifest.get("metadata_path", ""))
+    if not clean_video_path or not os.path.isfile(clean_video_path):
+        return None
+    if not frames_metadata_path or not os.path.isfile(frames_metadata_path):
+        return None
+
+    recorded_frame_ids: list[int] = []
+    try:
+        with open(frames_metadata_path, "r", encoding="utf-8") as fp:
+            for line in fp:
+                line = line.strip()
+                if not line:
+                    continue
+                row = json.loads(line)
+                recorded_frame_ids.append(int(row.get("frame_id", len(recorded_frame_ids))))
+    except Exception:
+        return None
+
+    overlay_by_frame_id: dict[int, tuple[_DetectionList, list[tuple[int, float, float, float, float, float, float]]]] = {}
+    try:
+        with open(overlay_jsonl_path, "r", encoding="utf-8") as fp:
+            for line in fp:
+                line = line.strip()
+                if not line:
+                    continue
+                row = json.loads(line)
+                frame_id = int(row.get("frame_id", -1))
+                if frame_id < 0:
+                    continue
+                detections = deserialize_detections(row.get("detections", []))
+                poses = [
+                    (
+                        int(p[0]),
+                        float(p[1]),
+                        float(p[2]),
+                        float(p[3]),
+                        float(p[4]),
+                        float(p[5]),
+                        float(p[6]),
+                    )
+                    for p in row.get("tag_poses", [])
+                    if isinstance(p, (list, tuple)) and len(p) == 7
+                ]
+                overlay_by_frame_id[frame_id] = (detections, poses)
+    except Exception:
+        return None
+
+    cap = cv2.VideoCapture(clean_video_path)
+    if cap is None or not cap.isOpened():
+        return None
+
+    fps = float(cap.get(cv2.CAP_PROP_FPS))
+    if fps <= 0.0:
+        fps = 30.0
+    width = int(max(1, cap.get(cv2.CAP_PROP_FRAME_WIDTH)))
+    height = int(max(1, cap.get(cv2.CAP_PROP_FRAME_HEIGHT)))
+
+    output_path = os.path.join(session_dir, "video_overlay.mp4")
+    writer = cv2.VideoWriter(
+        output_path,
+        cv2.VideoWriter_fourcc(*"mp4v"),
+        float(fps),
+        (width, height),
+    )
+    if not writer.isOpened():
+        cap.release()
+        try:
+            writer.release()
+        except Exception:
+            pass
+        return None
+
+    frame_index = 0
+    written_frames = 0
+    try:
+        while True:
+            ok, frame = cap.read()
+            if not ok or frame is None:
+                break
+
+            frame_id = recorded_frame_ids[frame_index] if frame_index < len(recorded_frame_ids) else frame_index
+            overlay_payload = overlay_by_frame_id.get(int(frame_id))
+            if overlay_payload is not None:
+                detections, poses = overlay_payload
+                draw_tag_detections(frame, detections, poses)
+
+            writer.write(frame)
+            frame_index += 1
+            written_frames += 1
+    finally:
+        cap.release()
+        writer.release()
+
+    try:
+        with open(os.path.join(session_dir, "overlay_manifest.json"), "w", encoding="utf-8") as fp:
+            json.dump(
+                {
+                    "input_video": clean_video_path,
+                    "overlay_jsonl": overlay_jsonl_path,
+                    "output_video": output_path,
+                    "frames_written": int(written_frames),
+                    "created_wall_ns": int(time.time_ns()),
+                },
+                fp,
+                indent=2,
+            )
+    except Exception:
+        pass
+
+    return output_path
 
 
 def get_frame_timestamp(video_frame) -> str:
@@ -2417,22 +2752,71 @@ def run_video_preview(
     video_loop: bool = False,
     video_deinterlace: str = "auto",
     interlaced_fast_profile: bool = False,
+    video_decode_backend: str = "auto",
+    video_decode_threads: int = 0,
+    raw_record_start_enabled: bool = True,
+    overlay_data_enable: bool = True,
 ) -> int:
     del freed_angle_scale, freed_listen_ip, freed_port
 
     source_name = os.path.basename(video_path)
-    capture, capture_backend, capture_hw_hint = open_video_capture(video_path)
-    if capture is None or not capture.isOpened():
-        print(f"ERROR: Failed to open video file: {video_path}")
-        return 2
+    decode_backend_request = str(video_decode_backend).strip().lower() or "auto"
+    decode_threads = max(0, int(video_decode_threads))
+    if decode_backend_request not in {"auto", "opencv", "pyav"}:
+        decode_backend_request = "auto"
 
-    source_fps = float(capture.get(cv2.CAP_PROP_FPS))
+    capture = None
+    capture_backend = "unavailable"
+    capture_hw_hint = False
+    use_pyav = False
+    pyav_codec_name = ""
+
+    if decode_backend_request in {"auto", "opencv"}:
+        capture, capture_backend, capture_hw_hint = open_video_capture(video_path)
+
+    source_fps = 0.0
+    source_frame_count = 0
+    source_width = 0
+    source_height = 0
+
+    if decode_backend_request in {"auto", "pyav"} and _PYAV_AVAILABLE:
+        try:
+            pyav_probe = PyAvVideoDecoder(video_path, decode_threads=decode_threads)
+            source_fps = float(pyav_probe.fps)
+            source_frame_count = int(pyav_probe.frame_count)
+            source_width = int(pyav_probe.width)
+            source_height = int(pyav_probe.height)
+            pyav_codec_name = pyav_probe.codec_name
+            pyav_probe.release()
+            use_pyav = True
+            capture_backend = f"PYAV/{pyav_codec_name or '?'}"
+            capture_hw_hint = True
+            if capture is not None:
+                capture.release()
+                capture = None
+        except Exception as exc:
+            if decode_backend_request == "pyav":
+                print(f"ERROR: Failed to open video with PyAV: {exc}")
+                return 2
+            print(f"Video decode: PyAV unavailable for this input ({exc}); falling back to OpenCV.")
+
+    if not use_pyav:
+        if capture is None or not capture.isOpened():
+            print(f"ERROR: Failed to open video file: {video_path}")
+            return 2
+        source_fps = float(capture.get(cv2.CAP_PROP_FPS))
+        source_frame_count = int(max(0, capture.get(cv2.CAP_PROP_FRAME_COUNT)))
+        source_width = int(max(0, capture.get(cv2.CAP_PROP_FRAME_WIDTH)))
+        source_height = int(max(0, capture.get(cv2.CAP_PROP_FRAME_HEIGHT)))
+
     if source_fps <= 0.0:
         source_fps = max(1.0, float(display_fps))
     effective_display_fps = min(max(1.0, float(display_fps)), source_fps)
-    source_frame_count = int(max(0, capture.get(cv2.CAP_PROP_FRAME_COUNT)))
-    source_width = int(max(0, capture.get(cv2.CAP_PROP_FRAME_WIDTH)))
-    source_height = int(max(0, capture.get(cv2.CAP_PROP_FRAME_HEIGHT)))
+
+    safe_source = "".join(ch if (ch.isalnum() or ch in ("-", "_")) else "_" for ch in os.path.splitext(source_name)[0])
+    safe_source = safe_source.strip("_") or "source"
+    session_stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    session_dir = os.path.join(raw_record_output_dir, f"{session_stamp}_{safe_source}")
     stream_info = probe_video_stream_info(video_path)
     field_order = str(stream_info.get("field_order") or "unknown")
     stream_codec_name = str(stream_info.get("codec_name") or "")
@@ -2480,8 +2864,15 @@ def run_video_preview(
         enabled=parquet_enable,
         output_dir=parquet_output_dir,
         source_name=source_name,
+        session_dir=session_dir,
     )
     parquet_pub.start()
+
+    overlay_writer = OverlayDataWriter(
+        enabled=overlay_data_enable,
+        session_dir=session_dir,
+    )
+    overlay_writer.start()
 
     def _publish_telemetry(topic_suffix: str, payload: dict) -> None:
         parquet_pub.publish(topic_suffix, payload)
@@ -2518,6 +2909,7 @@ def run_video_preview(
     _raw_toggle_lock = threading.Lock()
     _raw_toggle_last_request_s = [0.0]
     _raw_toggle_min_interval_s = 0.35
+    _raw_record_autostart_done = [False]
 
     def _toggle_telemetry_recording() -> bool:
         _telemetry_record_enabled[0] = not _telemetry_record_enabled[0]
@@ -2553,8 +2945,10 @@ def run_video_preview(
         detector_entries = _build_detector_entries_local()
         print(f"ArUco dictionaries: {', '.join(name for name, _, _ in detector_entries)}")
     except (RuntimeError, ValueError) as exc:
-        capture.release()
+        if capture is not None:
+            capture.release()
         raw_recorder.shutdown()
+        overlay_writer.stop()
         parquet_pub.stop()
         mqtt_pub.stop()
         telemetry.stop()
@@ -2569,8 +2963,10 @@ def run_video_preview(
             board_definition = load_board_definition(board_json)
             board_definitions.append(board_definition)
         except Exception as exc:
-            capture.release()
+            if capture is not None:
+                capture.release()
             raw_recorder.shutdown()
+            overlay_writer.stop()
             parquet_pub.stop()
             mqtt_pub.stop()
             telemetry.stop()
@@ -2607,8 +3003,10 @@ def run_video_preview(
         try:
             override_tag_sizes = load_tag_size_map_json(tag_size_map_json_path)
         except Exception as exc:
-            capture.release()
+            if capture is not None:
+                capture.release()
             raw_recorder.shutdown()
+            overlay_writer.stop()
             parquet_pub.stop()
             mqtt_pub.stop()
             telemetry.stop()
@@ -2886,6 +3284,29 @@ def run_video_preview(
                 tag_size_mm_by_id=effective_tag_size_mm_by_id,
             )
 
+            if overlay_data_enable and tag_count > 0:
+                overlay_writer.publish(
+                    {
+                        "frame_id": int(frame_id_local),
+                        "ts_wall_ns": int(frame_recv_wall_ns),
+                        "ts_mono_ns": int(frame_recv_mono_ns),
+                        "tag_count": int(tag_count),
+                        "tag_poses": [
+                            [
+                                int(p[0]),
+                                float(p[1]),
+                                float(p[2]),
+                                float(p[3]),
+                                float(p[4]),
+                                float(p[5]),
+                                float(p[6]),
+                            ]
+                            for p in tag_poses
+                        ],
+                        "detections": serialize_detections(detections),
+                    }
+                )
+
             with _result_lock:
                 _results_by_id[frame_id_local] = {
                     "tag_count": int(tag_count),
@@ -2958,96 +3379,181 @@ def run_video_preview(
     def capture_loop() -> None:
         capture_local = capture
         capture_backend_local = capture_backend
+        capture_fourcc = _decode_fourcc(capture_local.get(cv2.CAP_PROP_FOURCC)) if capture_local is not None else (stream_codec_name or pyav_codec_name or "?")
         frame_id_local = 0
         frame_counter = 0
         tick = time.perf_counter()
 
-        try:
-            while not _quit.is_set():
-                ok, source_bgr = capture_local.read()
-                if not ok or source_bgr is None:
-                    if video_loop:
-                        try:
-                            capture_local.release()
-                        except Exception:
-                            pass
-                        reopened_capture, capture_backend_local, _ = _reopen_capture()
-                        if reopened_capture is None:
-                            break
-                        capture_local = reopened_capture
-                        continue
-                    break
+        def _process_source_frame(
+            source_bgr_local: np.ndarray,
+            frame_index_local: int,
+            media_ts_ms_local: float,
+            backend_local: str,
+            fourcc_local: str,
+        ) -> bool:
+            nonlocal frame_id_local, frame_counter, tick
 
-                frame_index = int(max(0.0, capture_local.get(cv2.CAP_PROP_POS_FRAMES) - 1.0))
-                media_ts_ms = float(capture_local.get(cv2.CAP_PROP_POS_MSEC))
-                if media_ts_ms < 0.0:
-                    media_ts_ms = (frame_index / max(1.0, source_fps)) * 1000.0
+            analysis_bgr = source_bgr_local
+            if effective_deinterlace_mode == "blend":
+                analysis_bgr = deinterlace_frame_blend(source_bgr_local)
 
-                analysis_bgr = source_bgr
-                if effective_deinterlace_mode == "blend":
-                    analysis_bgr = deinterlace_frame_blend(source_bgr)
+            if _raw_record_toggle_request.is_set():
+                _raw_record_toggle_request.clear()
+                if raw_recorder.is_recording():
+                    raw_recorder.stop_recording()
+                else:
+                    record_width = max(1, int(round(source_bgr_local.shape[1] * effective_raw_record_scale)))
+                    record_height = max(1, int(round(source_bgr_local.shape[0] * effective_raw_record_scale)))
+                    raw_recorder.start_recording(
+                        frame_width=record_width,
+                        frame_height=record_height,
+                        session_dir=session_dir,
+                    )
 
-                ndi_meta = extract_video_meta(
-                    capture_local,
-                    source_name,
-                    capture_backend_local,
-                    frame_index,
-                    source_frame_count,
-                    media_ts_ms,
+            if raw_record_start_enabled and not _raw_record_autostart_done[0]:
+                _raw_record_autostart_done[0] = True
+                record_width = max(1, int(round(source_bgr_local.shape[1] * effective_raw_record_scale)))
+                record_height = max(1, int(round(source_bgr_local.shape[0] * effective_raw_record_scale)))
+                raw_recorder.start_recording(
+                    frame_width=record_width,
+                    frame_height=record_height,
+                    session_dir=session_dir,
                 )
-                ndi_meta["field_order"] = field_order
-                ndi_meta["deinterlace"] = effective_deinterlace_mode
-                if stream_codec_name:
-                    ndi_meta["codec_name"] = stream_codec_name
-                frame_ts = ndi_meta["timecode"]
-                frame_recv_wall_ns = int(time.time_ns())
-                frame_recv_mono_ns = int(time.perf_counter_ns())
 
-                while not _quit.is_set():
-                    try:
-                        frame_queue.put((frame_id_local, analysis_bgr, ndi_meta, frame_ts, frame_recv_wall_ns, frame_recv_mono_ns), timeout=0.1)
-                        break
-                    except queue.Full:
-                        continue
+            frame_recv_wall_ns = int(time.time_ns())
+            frame_recv_mono_ns = int(time.perf_counter_ns())
+            ndi_meta = build_video_meta(
+                source_name=source_name,
+                capture_backend=backend_local,
+                frame_index=frame_index_local,
+                frame_count=source_frame_count,
+                media_ts_ms=media_ts_ms_local,
+                xres=int(source_bgr_local.shape[1]),
+                yres=int(source_bgr_local.shape[0]),
+                fps=float(source_fps),
+                fourcc=fourcc_local,
+            )
+            ndi_meta["field_order"] = field_order
+            ndi_meta["deinterlace"] = effective_deinterlace_mode
+            if stream_codec_name:
+                ndi_meta["codec_name"] = stream_codec_name
+            frame_ts = ndi_meta["timecode"]
 
-                if _quit.is_set():
+            while not _quit.is_set():
+                try:
+                    frame_queue.put((frame_id_local, analysis_bgr, ndi_meta, frame_ts, frame_recv_wall_ns, frame_recv_mono_ns), timeout=0.1)
                     break
+                except queue.Full:
+                    continue
 
-                if not no_display:
-                    display_bgr = analysis_bgr
-                    if display_scale != 1.0:
-                        resized_width = max(1, int(round(display_bgr.shape[1] * display_scale)))
-                        resized_height = max(1, int(round(display_bgr.shape[0] * display_scale)))
-                        interpolation = cv2.INTER_AREA if display_scale < 1.0 else cv2.INTER_LINEAR
-                        display_bgr = cv2.resize(display_bgr, (resized_width, resized_height), interpolation=interpolation)
-                    else:
-                        display_bgr = display_bgr.copy()
-                    with _display_lock:
-                        _latest_display_packet[0] = (
-                            frame_id_local,
-                            display_bgr,
-                            source_bgr.copy(),
-                            dict(ndi_meta),
-                            frame_ts,
-                            frame_recv_wall_ns,
-                            frame_recv_mono_ns,
-                        )
+            if _quit.is_set():
+                return False
 
-                _last_captured_frame_id[0] = frame_id_local
-                frame_counter += 1
-                now_local = time.perf_counter()
-                elapsed = now_local - tick
-                if elapsed >= 1.0:
-                    with _stats_lock:
-                        _stats["capture_fps"] = frame_counter / elapsed
-                    frame_counter = 0
-                    tick = now_local
-                frame_id_local += 1
+            if raw_recorder.is_recording():
+                record_frame = source_bgr_local
+                if effective_raw_record_scale != 1.0:
+                    record_width = max(1, int(round(source_bgr_local.shape[1] * effective_raw_record_scale)))
+                    record_height = max(1, int(round(source_bgr_local.shape[0] * effective_raw_record_scale)))
+                    record_frame = cv2.resize(source_bgr_local, (record_width, record_height), interpolation=cv2.INTER_AREA)
+                raw_recorder.enqueue_frame(
+                    record_frame,
+                    {
+                        "frame_id": int(frame_id_local),
+                        "ts_wall_ns": int(frame_recv_wall_ns),
+                        "ts_mono_ns": int(frame_recv_mono_ns),
+                        "source_ts": str(frame_ts),
+                        "source_name": source_name,
+                        "field_order": field_order,
+                        "analysis_deinterlace": effective_deinterlace_mode,
+                        "tag_count": -1,
+                        "record_scale": float(effective_raw_record_scale),
+                        "recorded_wall_ns": int(time.time_ns()),
+                    },
+                )
+
+            if not no_display:
+                display_bgr = analysis_bgr
+                if display_scale != 1.0:
+                    resized_width = max(1, int(round(display_bgr.shape[1] * display_scale)))
+                    resized_height = max(1, int(round(display_bgr.shape[0] * display_scale)))
+                    interpolation = cv2.INTER_AREA if display_scale < 1.0 else cv2.INTER_LINEAR
+                    display_bgr = cv2.resize(display_bgr, (resized_width, resized_height), interpolation=interpolation)
+                else:
+                    display_bgr = display_bgr.copy()
+                with _display_lock:
+                    _latest_display_packet[0] = (
+                        frame_id_local,
+                        display_bgr,
+                        source_bgr_local.copy(),
+                        dict(ndi_meta),
+                        frame_ts,
+                        frame_recv_wall_ns,
+                        frame_recv_mono_ns,
+                    )
+
+            _last_captured_frame_id[0] = frame_id_local
+            frame_counter += 1
+            now_local = time.perf_counter()
+            elapsed = now_local - tick
+            if elapsed >= 1.0:
+                with _stats_lock:
+                    _stats["capture_fps"] = frame_counter / elapsed
+                frame_counter = 0
+                tick = now_local
+            frame_id_local += 1
+            return True
+
+        try:
+            if use_pyav:
+                while not _quit.is_set():
+                    decoder = None
+                    try:
+                        decoder = PyAvVideoDecoder(video_path, decode_threads=decode_threads)
+                        decode_fourcc = decoder.codec_name or stream_codec_name or pyav_codec_name or "?"
+                        decode_backend = f"PYAV/{decode_fourcc}"
+                        while not _quit.is_set():
+                            ok, source_bgr, frame_index, media_ts_ms = decoder.read()
+                            if not ok or source_bgr is None:
+                                break
+                            if not _process_source_frame(source_bgr, int(frame_index), float(media_ts_ms), decode_backend, decode_fourcc):
+                                break
+                    finally:
+                        if decoder is not None:
+                            decoder.release()
+
+                    if _quit.is_set() or not video_loop:
+                        break
+                    print(f"Video loop: restarted {source_name} using backend=PYAV")
+            else:
+                while not _quit.is_set():
+                    ok, source_bgr = capture_local.read()
+                    if not ok or source_bgr is None:
+                        if video_loop:
+                            try:
+                                capture_local.release()
+                            except Exception:
+                                pass
+                            reopened_capture, capture_backend_local, _ = _reopen_capture()
+                            if reopened_capture is None:
+                                break
+                            capture_local = reopened_capture
+                            capture_fourcc = _decode_fourcc(capture_local.get(cv2.CAP_PROP_FOURCC))
+                            continue
+                        break
+
+                    frame_index = int(max(0.0, capture_local.get(cv2.CAP_PROP_POS_FRAMES) - 1.0))
+                    media_ts_ms = float(capture_local.get(cv2.CAP_PROP_POS_MSEC))
+                    if media_ts_ms < 0.0:
+                        media_ts_ms = (frame_index / max(1.0, source_fps)) * 1000.0
+
+                    if not _process_source_frame(source_bgr, frame_index, media_ts_ms, capture_backend_local, capture_fourcc):
+                        break
         finally:
-            try:
-                capture_local.release()
-            except Exception:
-                pass
+            if capture_local is not None:
+                try:
+                    capture_local.release()
+                except Exception:
+                    pass
             _capture_done.set()
             for _ in range(worker_count):
                 while True:
@@ -3072,7 +3578,6 @@ def run_video_preview(
 
     try:
         next_display = time.perf_counter()
-        last_displayed_frame_id = -1
 
         while not _quit.is_set():
             if no_display:
@@ -3115,7 +3620,7 @@ def run_video_preview(
                 time.sleep(0.005)
                 continue
 
-            frame_id_local, display_bgr, raw_bgr, ndi_meta, frame_ts, frame_recv_wall_ns, frame_recv_mono_ns = display_packet
+            frame_id_local, display_bgr, _raw_bgr, ndi_meta, frame_ts, frame_recv_wall_ns, frame_recv_mono_ns = display_packet
 
             with _result_lock:
                 result = _results_by_id.get(frame_id_local)
@@ -3129,39 +3634,6 @@ def run_video_preview(
             overlay_age_frames = -1 if result is None else frame_id_local - used_result_id
             overlay_age_ms = -1.0 if result is None else max(0.0, (frame_recv_mono_ns - int(result["frame_recv_mono_ns"])) / 1_000_000.0)
             tag_count = 0 if result is None else int(result["tag_count"])
-
-            if _raw_record_toggle_request.is_set():
-                _raw_record_toggle_request.clear()
-                if raw_recorder.is_recording():
-                    raw_recorder.stop_recording()
-                else:
-                    record_width = max(1, int(round(raw_bgr.shape[1] * effective_raw_record_scale)))
-                    record_height = max(1, int(round(raw_bgr.shape[0] * effective_raw_record_scale)))
-                    raw_recorder.start_recording(frame_width=record_width, frame_height=record_height)
-
-            if raw_recorder.is_recording() and frame_id_local != last_displayed_frame_id:
-                record_frame = raw_bgr
-                if effective_raw_record_scale != 1.0:
-                    record_width = max(1, int(round(raw_bgr.shape[1] * effective_raw_record_scale)))
-                    record_height = max(1, int(round(raw_bgr.shape[0] * effective_raw_record_scale)))
-                    record_frame = cv2.resize(raw_bgr, (record_width, record_height), interpolation=cv2.INTER_AREA)
-                raw_recorder.enqueue_frame(
-                    record_frame,
-                    {
-                        "frame_id": int(frame_id_local),
-                        "ts_wall_ns": int(frame_recv_wall_ns),
-                        "ts_mono_ns": int(frame_recv_mono_ns),
-                        "source_ts": str(frame_ts),
-                        "source_name": source_name,
-                        "field_order": field_order,
-                        "analysis_deinterlace": effective_deinterlace_mode,
-                        "overlay_age_frames": int(overlay_age_frames),
-                        "overlay_age_ms": float(overlay_age_ms),
-                        "tag_count": int(tag_count),
-                        "record_scale": float(effective_raw_record_scale),
-                        "recorded_wall_ns": int(time.time_ns()),
-                    },
-                )
 
             image = display_bgr.copy()
             if result is not None:
@@ -3236,7 +3708,6 @@ def run_video_preview(
             else:
                 cv2.imshow(title, image)
 
-            last_displayed_frame_id = frame_id_local
             if _capture_done.is_set() and not any(thread.is_alive() for thread in analyze_threads) and frame_id_local >= _last_captured_frame_id[0]:
                 break
     except KeyboardInterrupt:
@@ -3247,6 +3718,15 @@ def run_video_preview(
         for thread in analyze_threads:
             thread.join(timeout=2.0)
         raw_recorder.shutdown()
+        overlay_jsonl_path, overlay_dropped = overlay_writer.stop()
+        if overlay_jsonl_path and os.path.isfile(overlay_jsonl_path):
+            overlay_video_path = render_overlay_video_pass(session_dir=session_dir, overlay_jsonl_path=overlay_jsonl_path)
+            if overlay_video_path:
+                print(f"Overlay pass: wrote {overlay_video_path}")
+            else:
+                print("Overlay pass: skipped (missing inputs or render failure)")
+            if overlay_dropped > 0:
+                print(f"OverlayData: dropped {overlay_dropped} rows due to queue pressure")
         if board_pose_stream is not None:
             board_pose_stream.stop()
         parquet_pub.stop()
@@ -4537,6 +5017,8 @@ def main() -> int:
     parser.add_argument("--video-search-dir", type=str, default="Videos", help="Folder used for --list and implicit input selection")
     parser.add_argument("--video-loop", action="store_true", help="Loop playback when the video reaches end-of-file")
     parser.add_argument("--video-no-realtime", action="store_true", help="Process as fast as possible instead of pacing to media timestamps")
+    parser.add_argument("--video-decode-backend", type=str, choices=["auto", "opencv", "pyav"], default="auto", help="Video decode backend (auto prefers pyav when available)")
+    parser.add_argument("--video-decode-threads", type=int, default=0, help="Decoder thread count for PyAV (0=FFmpeg default)")
     parser.add_argument("--video-deinterlace", type=str, choices=["auto", "off", "blend"], default="auto", help="Video deinterlace mode: auto uses stream metadata, blend applies a simple deinterlace filter, off keeps source frames untouched")
     parser.add_argument("--interlaced-fast-profile", action="store_true", help="Use a faster AprilTag detector profile when the source is interlaced or deinterlacing is enabled")
     parser.add_argument("--no-display", action="store_true", help="Receive and decode without opening an OpenCV window")
@@ -4555,6 +5037,8 @@ def main() -> int:
     parser.add_argument("--raw-record-ffmpeg-encoder", type=str, default="h264_nvenc", help="FFmpeg video encoder (for example: h264_nvenc, hevc_nvenc, libx264)")
     parser.add_argument("--raw-record-ffmpeg-preset", type=str, default="p5", help="FFmpeg encoder preset (for NVENC typical values: p1..p7)")
     parser.add_argument("--raw-record-scale", type=float, default=0.5, help="Scale factor applied to recorded frames (analysis still uses full frame)")
+    parser.add_argument("--raw-record-start-disabled", action="store_true", help="Do not auto-start clean recording at run start")
+    parser.add_argument("--overlay-data-disable", action="store_true", help="Disable overlay metadata capture and second-pass overlay rendering")
     parser.add_argument("--focal-length", type=float, default=1000.0, help="Camera focal length (pixels) for pose estimation")
     parser.add_argument("--tag-size-mm", type=float, default=148.6, help="Physical tag width in millimeters (default: 148.6)")
     parser.add_argument(
@@ -4712,6 +5196,10 @@ def main() -> int:
             video_loop=bool(args.video_loop),
             video_deinterlace=args.video_deinterlace,
             interlaced_fast_profile=bool(args.interlaced_fast_profile),
+            video_decode_backend=args.video_decode_backend,
+            video_decode_threads=max(0, int(args.video_decode_threads)),
+            raw_record_start_enabled=not bool(args.raw_record_start_disabled),
+            overlay_data_enable=not bool(args.overlay_data_disable),
         )
     except (RuntimeError, FileNotFoundError) as exc:
         print(f"ERROR: {exc}")
