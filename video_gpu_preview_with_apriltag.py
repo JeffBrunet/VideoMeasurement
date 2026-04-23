@@ -27,6 +27,15 @@ except Exception:
     _MQTT_AVAILABLE = False
 
 try:
+    pa = importlib.import_module("pyarrow")
+    pq = importlib.import_module("pyarrow.parquet")
+    _PARQUET_AVAILABLE = True
+except Exception:
+    pa = None
+    pq = None
+    _PARQUET_AVAILABLE = False
+
+try:
     import glfw
     from OpenGL.GL import (
         GL_BGR, GL_RGB, GL_TEXTURE_2D, GL_UNSIGNED_BYTE,
@@ -664,6 +673,159 @@ class MqttPublisher:
                     pass
             self._stop.wait(reconnect_backoff)
             reconnect_backoff = min(10.0, reconnect_backoff * 2.0)
+
+
+class ParquetTelemetryWriter:
+    """Async telemetry writer that persists MQTT-like payloads into a Parquet stream."""
+
+    def __init__(
+        self,
+        enabled: bool,
+        output_dir: str,
+        source_name: str,
+        flush_rows: int = 2000,
+        flush_interval_s: float = 1.0,
+    ) -> None:
+        self.enabled = bool(enabled)
+        self.output_dir = output_dir
+        self.source_name = source_name
+        self.flush_rows = max(200, int(flush_rows))
+        self.flush_interval_s = max(0.1, float(flush_interval_s))
+
+        self._queue: queue.Queue[tuple[str, dict]] = queue.Queue(maxsize=20000)
+        self._stop = threading.Event()
+        self._thread: threading.Thread | None = None
+        self._dropped = 0
+
+        if not self.enabled:
+            return
+        if not _PARQUET_AVAILABLE:
+            print("Parquet: pyarrow is not installed; parquet telemetry disabled.")
+            self.enabled = False
+
+    def start(self) -> None:
+        if not self.enabled:
+            return
+        self._thread = threading.Thread(target=self._run, daemon=True, name="parquet-telemetry")
+        self._thread.start()
+
+    def stop(self) -> None:
+        self._stop.set()
+        if self._thread is not None:
+            self._thread.join(timeout=5.0)
+
+    def publish(self, topic_suffix: str, payload: dict) -> None:
+        if not self.enabled:
+            return
+        try:
+            self._queue.put_nowait((topic_suffix.lstrip("/"), dict(payload)))
+        except queue.Full:
+            self._dropped += 1
+            try:
+                self._queue.get_nowait()
+            except queue.Empty:
+                pass
+            try:
+                self._queue.put_nowait((topic_suffix.lstrip("/"), dict(payload)))
+            except queue.Full:
+                self._dropped += 1
+
+    def _run(self) -> None:
+        assert pa is not None
+        assert pq is not None
+
+        stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        safe_source = "".join(ch if (ch.isalnum() or ch in ("-", "_")) else "_" for ch in self.source_name)
+        safe_source = safe_source.strip("_") or "source"
+        session_dir = os.path.join(self.output_dir, f"{stamp}_{safe_source}")
+        os.makedirs(session_dir, exist_ok=True)
+        parquet_path = os.path.join(session_dir, "telemetry.parquet")
+        manifest_path = os.path.join(session_dir, "manifest.json")
+
+        writer = None
+        rows: list[dict] = []
+        total_rows = 0
+        last_flush = time.perf_counter()
+
+        def _as_int(value: object) -> int | None:
+            try:
+                return int(value)
+            except Exception:
+                return None
+
+        def _flush_batch() -> None:
+            nonlocal writer, rows, total_rows, last_flush
+            if not rows:
+                return
+
+            columns = {
+                "topic": [row["topic"] for row in rows],
+                "event_type": [row["event_type"] for row in rows],
+                "ts_wall_ns": [row["ts_wall_ns"] for row in rows],
+                "ts_mono_ns": [row["ts_mono_ns"] for row in rows],
+                "ingest_seq": [row["ingest_seq"] for row in rows],
+                "frame_id": [row["frame_id"] for row in rows],
+                "payload_json": [row["payload_json"] for row in rows],
+            }
+            table = pa.table(columns)
+
+            if writer is None:
+                writer = pq.ParquetWriter(parquet_path, table.schema, compression="zstd")
+            writer.write_table(table)
+            total_rows += len(rows)
+            rows = []
+            last_flush = time.perf_counter()
+
+        try:
+            print(f"Parquet: writing telemetry -> {parquet_path}")
+            while not self._stop.is_set() or not self._queue.empty():
+                try:
+                    topic_suffix, payload = self._queue.get(timeout=0.2)
+                    rows.append(
+                        {
+                            "topic": str(topic_suffix),
+                            "event_type": str(payload.get("type", "")),
+                            "ts_wall_ns": _as_int(payload.get("ts_wall_ns")),
+                            "ts_mono_ns": _as_int(payload.get("ts_mono_ns")),
+                            "ingest_seq": _as_int(payload.get("ingest_seq")),
+                            "frame_id": _as_int(payload.get("frame_id")),
+                            "payload_json": json.dumps(payload, separators=(",", ":")),
+                        }
+                    )
+                except queue.Empty:
+                    pass
+
+                should_flush = len(rows) >= self.flush_rows
+                if rows and (time.perf_counter() - last_flush) >= self.flush_interval_s:
+                    should_flush = True
+                if should_flush:
+                    _flush_batch()
+
+            _flush_batch()
+        except Exception as exc:
+            print(f"Parquet: writer error ({exc})")
+        finally:
+            if writer is not None:
+                try:
+                    writer.close()
+                except Exception:
+                    pass
+
+            try:
+                with open(manifest_path, "w", encoding="utf-8") as manifest_fp:
+                    json.dump(
+                        {
+                            "source_name": self.source_name,
+                            "parquet_path": parquet_path,
+                            "row_count": int(total_rows),
+                            "dropped_events": int(self._dropped),
+                            "created_wall_ns": int(time.time_ns()),
+                        },
+                        manifest_fp,
+                        indent=2,
+                    )
+            except Exception:
+                pass
 
 
 class RawFrameRecorder:
@@ -2227,6 +2389,8 @@ def run_video_preview(
     mqtt_host: str = "127.0.0.1",
     mqtt_port: int = 1883,
     mqtt_topic_prefix: str = "video/telemetry",
+    parquet_enable: bool = True,
+    parquet_output_dir: str = "recordings/telemetry",
     board_pose_stream_enable: bool = False,
     board_pose_stream_host: str = "0.0.0.0",
     board_pose_stream_port: int = 9102,
@@ -2236,6 +2400,7 @@ def run_video_preview(
     raw_record_ffmpeg_bin: str = "ffmpeg",
     raw_record_ffmpeg_encoder: str = "h264_nvenc",
     raw_record_ffmpeg_preset: str = "p5",
+    raw_record_scale: float = 0.5,
     telemetry_record_start_enabled: bool = True,
     board_json_paths: list[str] | None = None,
     tag_size_map_json_path: str | None = None,
@@ -2275,6 +2440,7 @@ def run_video_preview(
     interlaced_source = video_field_order_is_interlaced(field_order)
 
     effective_quad_decimate = float(april_tag_quad_decimate)
+    effective_raw_record_scale = min(1.0, max(0.05, float(raw_record_scale)))
     effective_corner_refinement_method = corner_refinement_method
     if interlaced_fast_profile and (interlaced_source or effective_deinterlace_mode != "off"):
         effective_quad_decimate = max(effective_quad_decimate, 2.5)
@@ -2309,6 +2475,17 @@ def run_video_preview(
         client_id=f"video-preview-{os.getpid()}",
     )
     mqtt_pub.start()
+
+    parquet_pub = ParquetTelemetryWriter(
+        enabled=parquet_enable,
+        output_dir=parquet_output_dir,
+        source_name=source_name,
+    )
+    parquet_pub.start()
+
+    def _publish_telemetry(topic_suffix: str, payload: dict) -> None:
+        parquet_pub.publish(topic_suffix, payload)
+        mqtt_pub.publish(topic_suffix, payload)
 
     board_pose_stream = None
     if board_pose_stream_enable:
@@ -2378,6 +2555,7 @@ def run_video_preview(
     except (RuntimeError, ValueError) as exc:
         capture.release()
         raw_recorder.shutdown()
+        parquet_pub.stop()
         mqtt_pub.stop()
         telemetry.stop()
         if board_pose_stream is not None:
@@ -2393,6 +2571,7 @@ def run_video_preview(
         except Exception as exc:
             capture.release()
             raw_recorder.shutdown()
+            parquet_pub.stop()
             mqtt_pub.stop()
             telemetry.stop()
             if board_pose_stream is not None:
@@ -2430,6 +2609,7 @@ def run_video_preview(
         except Exception as exc:
             capture.release()
             raw_recorder.shutdown()
+            parquet_pub.stop()
             mqtt_pub.stop()
             telemetry.stop()
             if board_pose_stream is not None:
@@ -2529,7 +2709,8 @@ def run_video_preview(
     if not no_display:
         print(
             f"Display sync: fps={effective_display_fps:.1f} scale={display_scale:.2f} "
-            f"prep_oversample={max(1.0, display_prep_oversample):.2f} delay={max(0, display_delay_frames)}f timeout={max(0.0, sync_timeout_ms):.0f}ms"
+            f"prep_oversample={max(1.0, display_prep_oversample):.2f} delay={max(0, display_delay_frames)}f timeout={max(0.0, sync_timeout_ms):.0f}ms "
+            f"record_scale={effective_raw_record_scale:.2f}"
         )
         _ensure_display_ready()
 
@@ -2583,7 +2764,7 @@ def run_video_preview(
             tag_size_used_mm = float(effective_tag_size_mm_by_id.get(int(tid), tag_size_mm))
             img_m = tag_image_metrics.get(int(tid), {})
             quat_w, quat_x, quat_y, quat_z = tag_quaternions.get(int(tid), euler_deg_to_quaternion(roll, pitch, yaw))
-            mqtt_pub.publish(
+            _publish_telemetry(
                 "tag_pose",
                 {
                     "type": "tag_pose",
@@ -2633,7 +2814,7 @@ def run_video_preview(
 
             board_x, board_y, board_z, board_roll, board_pitch, board_yaw, board_tag_count, board_tag_expected = board_pose
             quat_w, quat_x, quat_y, quat_z = euler_deg_to_quaternion(board_roll, board_pitch, board_yaw)
-            mqtt_pub.publish(
+            _publish_telemetry(
                 "board_pose",
                 {
                     "type": "board_pose",
@@ -2685,7 +2866,8 @@ def run_video_preview(
             if packet is None:
                 break
 
-            frame_id_local, gray, ndi_meta, frame_ts, frame_recv_wall_ns, frame_recv_mono_ns = packet
+            frame_id_local, analysis_bgr, ndi_meta, frame_ts, frame_recv_wall_ns, frame_recv_mono_ns = packet
+            gray = cv2.cvtColor(analysis_bgr, cv2.COLOR_BGR2GRAY)
 
             if camera_matrix_local is None:
                 h_gray, w_gray = gray.shape[:2]
@@ -2750,7 +2932,7 @@ def run_video_preview(
             )
 
             if should_log and _is_telemetry_recording_enabled():
-                mqtt_pub.publish(
+                _publish_telemetry(
                     "stats",
                     {
                         "type": "stats",
@@ -2805,7 +2987,6 @@ def run_video_preview(
                 if effective_deinterlace_mode == "blend":
                     analysis_bgr = deinterlace_frame_blend(source_bgr)
 
-                gray = cv2.cvtColor(analysis_bgr, cv2.COLOR_BGR2GRAY)
                 ndi_meta = extract_video_meta(
                     capture_local,
                     source_name,
@@ -2824,7 +3005,7 @@ def run_video_preview(
 
                 while not _quit.is_set():
                     try:
-                        frame_queue.put((frame_id_local, gray, ndi_meta, frame_ts, frame_recv_wall_ns, frame_recv_mono_ns), timeout=0.1)
+                        frame_queue.put((frame_id_local, analysis_bgr, ndi_meta, frame_ts, frame_recv_wall_ns, frame_recv_mono_ns), timeout=0.1)
                         break
                     except queue.Full:
                         continue
@@ -2954,11 +3135,18 @@ def run_video_preview(
                 if raw_recorder.is_recording():
                     raw_recorder.stop_recording()
                 else:
-                    raw_recorder.start_recording(frame_width=raw_bgr.shape[1], frame_height=raw_bgr.shape[0])
+                    record_width = max(1, int(round(raw_bgr.shape[1] * effective_raw_record_scale)))
+                    record_height = max(1, int(round(raw_bgr.shape[0] * effective_raw_record_scale)))
+                    raw_recorder.start_recording(frame_width=record_width, frame_height=record_height)
 
             if raw_recorder.is_recording() and frame_id_local != last_displayed_frame_id:
+                record_frame = raw_bgr
+                if effective_raw_record_scale != 1.0:
+                    record_width = max(1, int(round(raw_bgr.shape[1] * effective_raw_record_scale)))
+                    record_height = max(1, int(round(raw_bgr.shape[0] * effective_raw_record_scale)))
+                    record_frame = cv2.resize(raw_bgr, (record_width, record_height), interpolation=cv2.INTER_AREA)
                 raw_recorder.enqueue_frame(
-                    raw_bgr,
+                    record_frame,
                     {
                         "frame_id": int(frame_id_local),
                         "ts_wall_ns": int(frame_recv_wall_ns),
@@ -2970,6 +3158,7 @@ def run_video_preview(
                         "overlay_age_frames": int(overlay_age_frames),
                         "overlay_age_ms": float(overlay_age_ms),
                         "tag_count": int(tag_count),
+                        "record_scale": float(effective_raw_record_scale),
                         "recorded_wall_ns": int(time.time_ns()),
                     },
                 )
@@ -3060,6 +3249,7 @@ def run_video_preview(
         raw_recorder.shutdown()
         if board_pose_stream is not None:
             board_pose_stream.stop()
+        parquet_pub.stop()
         mqtt_pub.stop()
         telemetry.stop()
         if not no_display:
@@ -4364,6 +4554,7 @@ def main() -> int:
     parser.add_argument("--raw-record-ffmpeg-bin", type=str, default="ffmpeg", help="FFmpeg executable/path used when raw-record backend is ffmpeg or auto")
     parser.add_argument("--raw-record-ffmpeg-encoder", type=str, default="h264_nvenc", help="FFmpeg video encoder (for example: h264_nvenc, hevc_nvenc, libx264)")
     parser.add_argument("--raw-record-ffmpeg-preset", type=str, default="p5", help="FFmpeg encoder preset (for NVENC typical values: p1..p7)")
+    parser.add_argument("--raw-record-scale", type=float, default=0.5, help="Scale factor applied to recorded frames (analysis still uses full frame)")
     parser.add_argument("--focal-length", type=float, default=1000.0, help="Camera focal length (pixels) for pose estimation")
     parser.add_argument("--tag-size-mm", type=float, default=148.6, help="Physical tag width in millimeters (default: 148.6)")
     parser.add_argument(
@@ -4382,6 +4573,8 @@ def main() -> int:
     parser.add_argument("--freed-listen-ip", type=str, default="0.0.0.0", help="IP to bind for freeD UDP listener (default: 0.0.0.0)")
     parser.add_argument("--freed-port", type=int, default=10244, help="UDP port for freeD packets (default: 10244)")
     parser.add_argument("--mqtt-enable", action="store_true", help="Enable MQTT telemetry publishing")
+    parser.add_argument("--parquet-disable", action="store_true", help="Disable Parquet telemetry sink (enabled by default)")
+    parser.add_argument("--parquet-output-dir", type=str, default="recordings/telemetry", help="Output directory for Parquet telemetry sessions")
     parser.add_argument("--mqtt-host", type=str, default="127.0.0.1", help="MQTT broker host (default: 127.0.0.1)")
     parser.add_argument("--mqtt-port", type=int, default=1883, help="MQTT broker port (default: 1883)")
     parser.add_argument("--mqtt-topic-prefix", type=str, default="video/telemetry", help="MQTT topic prefix")
@@ -4491,6 +4684,8 @@ def main() -> int:
             mqtt_host=args.mqtt_host,
             mqtt_port=int(args.mqtt_port),
             mqtt_topic_prefix=args.mqtt_topic_prefix,
+            parquet_enable=not bool(args.parquet_disable),
+            parquet_output_dir=args.parquet_output_dir,
             board_pose_stream_enable=bool(args.board_pose_stream_enable),
             board_pose_stream_host=args.board_pose_stream_host,
             board_pose_stream_port=int(args.board_pose_stream_port),
@@ -4500,6 +4695,7 @@ def main() -> int:
             raw_record_ffmpeg_bin=args.raw_record_ffmpeg_bin,
             raw_record_ffmpeg_encoder=args.raw_record_ffmpeg_encoder,
             raw_record_ffmpeg_preset=args.raw_record_ffmpeg_preset,
+            raw_record_scale=float(args.raw_record_scale),
             telemetry_record_start_enabled=not bool(args.telemetry_record_start_disabled),
             board_json_paths=board_json_paths,
             # Detector tuning parameters

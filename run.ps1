@@ -24,8 +24,11 @@ param(
     [string]$RawRecordFfmpegBin = 'ffmpeg',
     [string]$RawRecordFfmpegEncoder = 'h264_nvenc',
     [string]$RawRecordFfmpegPreset = 'p5',
+    [double]$RawRecordScale = 0.5,
     [switch]$MqttEnable,
     [switch]$MqttDisable,
+    [switch]$ParquetDisable,
+    [string]$ParquetOutputDir = 'recordings\telemetry',
     [string]$MqttHost = '127.0.0.1',
     [int]$MqttPort = 1883,
     [string]$MqttTopicPrefix = 'ndi/telemetry',
@@ -172,6 +175,7 @@ $resolvedVideoSearchDir = Resolve-OptionalPath -RawValue $VideoSearchDir
 $resolvedTagSizeMapJson = Resolve-OptionalPath -RawValue $TagSizeMapJson
 $resolvedBoardJsonPaths = Resolve-BoardJsonPaths -RawValue $BoardJson
 $resolvedRawRecordOutputDir = Resolve-OptionalPath -RawValue $RawRecordOutputDir
+$resolvedParquetOutputDir = Resolve-OptionalPath -RawValue $ParquetOutputDir
 $resolvedFfmpegBin = Resolve-FfmpegExecutable -ConfiguredBin $RawRecordFfmpegBin
 
 $pyArgs = @(
@@ -190,6 +194,8 @@ $pyArgs = @(
     '--raw-record-ffmpeg-bin', $resolvedFfmpegBin,
     '--raw-record-ffmpeg-encoder', $RawRecordFfmpegEncoder,
     '--raw-record-ffmpeg-preset', $RawRecordFfmpegPreset,
+    '--raw-record-scale', "$RawRecordScale",
+    '--parquet-output-dir', $resolvedParquetOutputDir,
     '--mqtt-host', $MqttHost,
     '--mqtt-port', "$MqttPort",
     '--mqtt-topic-prefix', $MqttTopicPrefix,
@@ -224,8 +230,11 @@ if ($NoDisplay.IsPresent) {
 if ($null -ne $CornerRefinementMethod) {
     $pyArgs += @('--corner-refinement-method', "$CornerRefinementMethod")
 }
-if ($MqttEnable.IsPresent -or -not $MqttDisable.IsPresent) {
+if ($MqttEnable.IsPresent -and -not $MqttDisable.IsPresent) {
     $pyArgs += '--mqtt-enable'
+}
+if ($ParquetDisable.IsPresent) {
+    $pyArgs += '--parquet-disable'
 }
 if ($BoardPoseStreamEnable.IsPresent) {
     $pyArgs += '--board-pose-stream-enable'
