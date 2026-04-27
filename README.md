@@ -24,6 +24,9 @@ Video-file AprilTag measurement project derived from the NDIMeasurement workspac
 - `./run.ps1 -VideoPath '.\Videos\JEff Move.mov'`
 - `./run.ps1 -VideoNoRealtime`
 - `./run.ps1 -Display` (show realtime preview; default is headless)
+- `./run.ps1 -BoardJson 'boards\board_41-45-1920x1080.json,boards\boardLab55center.json'`
+- `./run_2board.ps1`
+- `./run_2board_pyav_norealtime.ps1`
 - `./run.ps1 -VideoDecodeBackend pyav`
 - `./run.ps1 -MqttEnable -BoardPoseStreamEnable`
 - `./run.ps1 -ParquetDisable -MqttEnable` (MQTT-only telemetry)

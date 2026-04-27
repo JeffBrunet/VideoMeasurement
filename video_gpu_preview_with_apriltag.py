@@ -61,6 +61,13 @@ except Exception:
 VIDEO_FILE_EXTENSIONS = (".mov", ".mp4", ".m4v", ".avi", ".mkv")
 
 
+def session_file_tag(session_dir: str) -> str:
+    base = os.path.basename(os.path.normpath(session_dir))
+    safe = "".join(ch if (ch.isalnum() or ch in ("-", "_")) else "_" for ch in base)
+    safe = safe.strip("_")
+    return safe or "session"
+
+
 def list_video_files(video_search_dir: str) -> list[str]:
     search_root = os.path.abspath(video_search_dir)
     if not os.path.isdir(search_root):
@@ -776,8 +783,9 @@ class ParquetTelemetryWriter:
             safe_source = safe_source.strip("_") or "source"
             session_dir = os.path.join(self.output_dir, f"{stamp}_{safe_source}")
         os.makedirs(session_dir, exist_ok=True)
-        parquet_path = os.path.join(session_dir, "telemetry.parquet")
-        manifest_path = os.path.join(session_dir, "manifest.json")
+        session_tag = session_file_tag(session_dir)
+        parquet_path = os.path.join(session_dir, f"telemetry_{session_tag}.parquet")
+        manifest_path = os.path.join(session_dir, "telemetry_manifest.json")
 
         writer = None
         rows: list[dict] = []
@@ -1048,7 +1056,14 @@ class RawFrameRecorder:
         with self._lock:
             return int(self._dropped_frames)
 
-    def start_recording(self, frame_width: int, frame_height: int, session_dir: str | None = None) -> bool:
+    def start_recording(
+        self,
+        frame_width: int,
+        frame_height: int,
+        session_dir: str | None = None,
+        expected_frame_count: int = 0,
+        progress_step_pct: int = 5,
+    ) -> bool:
         with self._lock:
             if self._active:
                 return False
@@ -1070,6 +1085,8 @@ class RawFrameRecorder:
                 "ffmpeg_bin": self.ffmpeg_bin,
                 "ffmpeg_encoder": self.ffmpeg_encoder,
                 "ffmpeg_preset": self.ffmpeg_preset,
+                "expected_frame_count": int(max(0, expected_frame_count)),
+                "progress_step_pct": int(max(1, min(50, progress_step_pct))),
             },
         ))
         print(f"Raw recorder: START requested -> {session_dir}")
@@ -1124,7 +1141,8 @@ class RawFrameRecorder:
         frame_height: int,
         target_fps: float,
     ) -> tuple[cv2.VideoWriter | None, str]:
-        mp4_path = os.path.join(session_dir, "video_raw.mp4")
+        session_tag = session_file_tag(session_dir)
+        mp4_path = os.path.join(session_dir, f"video_raw_{session_tag}.mp4")
         writer = cv2.VideoWriter(
             mp4_path,
             cv2.VideoWriter_fourcc(*"mp4v"),
@@ -1139,7 +1157,7 @@ class RawFrameRecorder:
         except Exception:
             pass
 
-        avi_path = os.path.join(session_dir, "video_raw.avi")
+        avi_path = os.path.join(session_dir, f"video_raw_{session_tag}.avi")
         writer = cv2.VideoWriter(
             avi_path,
             cv2.VideoWriter_fourcc(*"MJPG"),
@@ -1170,7 +1188,8 @@ class RawFrameRecorder:
             print(f"Raw recorder: ffmpeg binary not found (configured='{ffmpeg_bin}')")
             return None, ""
 
-        video_path = os.path.join(session_dir, "video_raw.mp4")
+        session_tag = session_file_tag(session_dir)
+        video_path = os.path.join(session_dir, f"video_raw_{session_tag}.mp4")
         cmd = [
             ffmpeg_exe,
             "-y",
@@ -1308,9 +1327,14 @@ class RawFrameRecorder:
         ffmpeg_bin = self.ffmpeg_bin
         ffmpeg_encoder = self.ffmpeg_encoder
         ffmpeg_preset = self.ffmpeg_preset
+        expected_frame_count = 0
+        progress_step_pct = 5
+        next_progress_pct = 5
+        progress_last_printed = -1
 
         def close_session() -> None:
             nonlocal writer_kind, writer_obj, metadata_fp, frame_count, manifest_path, video_path, start_wall_ns
+            nonlocal expected_frame_count, progress_step_pct, next_progress_pct, progress_last_printed
             session_backend = writer_kind
             session_manifest_path = manifest_path
             session_video_path = video_path
@@ -1368,8 +1392,14 @@ class RawFrameRecorder:
                     pass
             manifest_path = ""
             video_path = ""
+            if expected_frame_count > 0 and frame_count > 0 and progress_last_printed < 100:
+                print(f"Raw recorder progress: 100% ({frame_count}/{expected_frame_count})")
             frame_count = 0
             start_wall_ns = 0
+            expected_frame_count = 0
+            progress_step_pct = 5
+            next_progress_pct = 5
+            progress_last_printed = -1
 
         while not self._stop.is_set() or not self._queue.empty():
             try:
@@ -1389,6 +1419,10 @@ class RawFrameRecorder:
                 ffmpeg_bin = str(cfg.get("ffmpeg_bin", self.ffmpeg_bin)).strip() or "ffmpeg"
                 ffmpeg_encoder = str(cfg.get("ffmpeg_encoder", self.ffmpeg_encoder)).strip() or "h264_nvenc"
                 ffmpeg_preset = str(cfg.get("ffmpeg_preset", self.ffmpeg_preset)).strip() or "p5"
+                expected_frame_count = int(max(0, int(cfg.get("expected_frame_count", 0))))
+                progress_step_pct = int(max(1, min(50, int(cfg.get("progress_step_pct", 5)))))
+                next_progress_pct = progress_step_pct
+                progress_last_printed = -1
                 start_wall_ns = int(time.time_ns())
                 frame_count = 0
 
@@ -1437,6 +1471,16 @@ class RawFrameRecorder:
                     metadata_row["record_index"] = int(frame_count)
                     metadata_fp.write(json.dumps(metadata_row, separators=(",", ":")) + "\n")
                     frame_count += 1
+                    if expected_frame_count > 0:
+                        pct = int(min(100, (frame_count * 100) // expected_frame_count))
+                        while pct >= next_progress_pct and next_progress_pct <= 100:
+                            if next_progress_pct != progress_last_printed:
+                                print(
+                                    f"Raw recorder progress: {next_progress_pct}% "
+                                    f"({frame_count}/{expected_frame_count})"
+                                )
+                                progress_last_printed = next_progress_pct
+                            next_progress_pct += progress_step_pct
                 except Exception as exc:
                     if writer_kind == "ffmpeg":
                         ffmpeg_stopped = False
@@ -2282,6 +2326,31 @@ def scale_detections_for_display(
     return scaled_detections
 
 
+def scale_detections_xy(
+    detections: _DetectionList,
+    scale_x: float,
+    scale_y: float,
+) -> _DetectionList:
+    if abs(scale_x - 1.0) < 1e-6 and abs(scale_y - 1.0) < 1e-6:
+        return detections
+
+    scaled_detections: _DetectionList = []
+    for dict_name, corners, ids in detections:
+        if not corners or ids is None:
+            scaled_detections.append((dict_name, corners, ids))
+            continue
+
+        scaled_corners: list[np.ndarray] = []
+        for corner in corners:
+            corner_scaled = corner.astype(np.float32).copy()
+            corner_scaled[:, :, 0] *= float(scale_x)
+            corner_scaled[:, :, 1] *= float(scale_y)
+            scaled_corners.append(corner_scaled)
+        scaled_detections.append((dict_name, scaled_corners, ids))
+
+    return scaled_detections
+
+
 def serialize_detections(detections: _DetectionList) -> list[dict]:
     serialized: list[dict] = []
     for dict_name, corners, ids in detections:
@@ -2313,6 +2382,7 @@ def draw_tag_detections(
     image: np.ndarray,
     detections: _DetectionList,
     poses: list[tuple[int, float, float, float, float, float, float]],
+    line_thickness: int = 1,
 ) -> None:
     """Draw tag borders, IDs, and pose text onto a BGR image (in-place)."""
     colors = {
@@ -2328,10 +2398,10 @@ def draw_tag_detections(
         color = colors.get(dict_name, (255, 255, 0))
         for corner, tag_id in zip(corners, ids.flatten()):
             pts = corner.reshape(-1, 2).astype(int)
-            cv2.polylines(image, [pts], True, color, 2)
+            cv2.polylines(image, [pts], True, color, max(1, int(line_thickness)), cv2.LINE_AA)
             cx = int(np.mean(pts[:, 0]))
             cy = int(np.mean(pts[:, 1]))
-            cv2.circle(image, (cx, cy), 3, color, -1)
+            cv2.circle(image, (cx, cy), 2, color, -1, cv2.LINE_AA)
             tl = pts[0]
             label = f"ID:{tag_id}"
             cv2.putText(image, label, (tl[0] + 4, tl[1] - 4), cv2.FONT_HERSHEY_SIMPLEX, 0.4, (0, 0, 0), 2, cv2.LINE_AA)
@@ -2425,7 +2495,7 @@ def render_overlay_video_pass(session_dir: str, overlay_jsonl_path: str) -> str 
     if not frames_metadata_path or not os.path.isfile(frames_metadata_path):
         return None
 
-    recorded_frame_ids: list[int] = []
+    recorded_rows: list[dict] = []
     try:
         with open(frames_metadata_path, "r", encoding="utf-8") as fp:
             for line in fp:
@@ -2433,11 +2503,17 @@ def render_overlay_video_pass(session_dir: str, overlay_jsonl_path: str) -> str 
                 if not line:
                     continue
                 row = json.loads(line)
-                recorded_frame_ids.append(int(row.get("frame_id", len(recorded_frame_ids))))
+                recorded_rows.append(
+                    {
+                        "frame_id": int(row.get("frame_id", len(recorded_rows))),
+                        "source_ts": str(row.get("source_ts", "")),
+                        "source_name": str(row.get("source_name", "")),
+                    }
+                )
     except Exception:
         return None
 
-    overlay_by_frame_id: dict[int, tuple[_DetectionList, list[tuple[int, float, float, float, float, float, float]]]] = {}
+    overlay_by_frame_id: dict[int, tuple[_DetectionList, list[tuple[int, float, float, float, float, float, float]], int, int]] = {}
     try:
         with open(overlay_jsonl_path, "r", encoding="utf-8") as fp:
             for line in fp:
@@ -2462,7 +2538,9 @@ def render_overlay_video_pass(session_dir: str, overlay_jsonl_path: str) -> str 
                     for p in row.get("tag_poses", [])
                     if isinstance(p, (list, tuple)) and len(p) == 7
                 ]
-                overlay_by_frame_id[frame_id] = (detections, poses)
+                analysis_width = int(row.get("analysis_width", 0))
+                analysis_height = int(row.get("analysis_height", 0))
+                overlay_by_frame_id[frame_id] = (detections, poses, analysis_width, analysis_height)
     except Exception:
         return None
 
@@ -2476,7 +2554,8 @@ def render_overlay_video_pass(session_dir: str, overlay_jsonl_path: str) -> str 
     width = int(max(1, cap.get(cv2.CAP_PROP_FRAME_WIDTH)))
     height = int(max(1, cap.get(cv2.CAP_PROP_FRAME_HEIGHT)))
 
-    output_path = os.path.join(session_dir, "video_overlay.mp4")
+    session_tag = session_file_tag(session_dir)
+    output_path = os.path.join(session_dir, f"video_overlay_{session_tag}.mp4")
     writer = cv2.VideoWriter(
         output_path,
         cv2.VideoWriter_fourcc(*"mp4v"),
@@ -2499,11 +2578,41 @@ def render_overlay_video_pass(session_dir: str, overlay_jsonl_path: str) -> str 
             if not ok or frame is None:
                 break
 
-            frame_id = recorded_frame_ids[frame_index] if frame_index < len(recorded_frame_ids) else frame_index
+            frame_row = recorded_rows[frame_index] if frame_index < len(recorded_rows) else {
+                "frame_id": frame_index,
+                "source_ts": "",
+                "source_name": "",
+            }
+            frame_id = int(frame_row["frame_id"])
             overlay_payload = overlay_by_frame_id.get(int(frame_id))
             if overlay_payload is not None:
-                detections, poses = overlay_payload
-                draw_tag_detections(frame, detections, poses)
+                detections, poses, analysis_width, analysis_height = overlay_payload
+                if analysis_width > 0 and analysis_height > 0:
+                    detections = scale_detections_xy(
+                        detections,
+                        scale_x=float(width) / float(analysis_width),
+                        scale_y=float(height) / float(analysis_height),
+                    )
+                draw_tag_detections(frame, detections, poses, line_thickness=1)
+
+            # Overlay-video-only reticle at image center.
+            cx_r, cy_r = width // 2, height // 2
+            cv2.line(frame, (cx_r - 18, cy_r), (cx_r + 18, cy_r), (0, 255, 0), 1, cv2.LINE_AA)
+            cv2.line(frame, (cx_r, cy_r - 18), (cx_r, cy_r + 18), (0, 255, 0), 1, cv2.LINE_AA)
+            cv2.circle(frame, (cx_r, cy_r), 2, (0, 255, 0), -1, cv2.LINE_AA)
+
+            # Overlay-video-only top-left labels.
+            ts_text = str(frame_row.get("source_ts", "")).strip() or "-"
+            src_text = str(frame_row.get("source_name", "")).strip() or os.path.basename(clean_video_path)
+            lines = [
+                f"File: {src_text}",
+                f"TS: {ts_text}",
+            ]
+            y = 18
+            for text in lines:
+                cv2.putText(frame, text, (8, y), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (0, 0, 0), 2, cv2.LINE_AA)
+                cv2.putText(frame, text, (8, y), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (0, 255, 255), 1, cv2.LINE_AA)
+                y += 16
 
             writer.write(frame)
             frame_index += 1
@@ -3290,6 +3399,8 @@ def run_video_preview(
                         "frame_id": int(frame_id_local),
                         "ts_wall_ns": int(frame_recv_wall_ns),
                         "ts_mono_ns": int(frame_recv_mono_ns),
+                        "analysis_width": int(analysis_bgr.shape[1]),
+                        "analysis_height": int(analysis_bgr.shape[0]),
                         "tag_count": int(tag_count),
                         "tag_poses": [
                             [
@@ -3408,6 +3519,7 @@ def run_video_preview(
                         frame_width=record_width,
                         frame_height=record_height,
                         session_dir=session_dir,
+                        expected_frame_count=int(max(0, source_frame_count)),
                     )
 
             if raw_record_start_enabled and not _raw_record_autostart_done[0]:
@@ -3418,6 +3530,7 @@ def run_video_preview(
                     frame_width=record_width,
                     frame_height=record_height,
                     session_dir=session_dir,
+                    expected_frame_count=int(max(0, source_frame_count)),
                 )
 
             frame_recv_wall_ns = int(time.time_ns())
